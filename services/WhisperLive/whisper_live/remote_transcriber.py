@@ -148,7 +148,7 @@ class RemoteTranscriber:
                 "Remote transcriber URL not provided. Set REMOTE_TRANSCRIBER_URL environment variable "
                 "or pass api_url parameter."
             )
-        
+
         self.api_key = (api_key or os.getenv("REMOTE_TRANSCRIBER_API_KEY") or "").strip()
         if not self.api_key:
             raise ValueError(
@@ -157,7 +157,15 @@ class RemoteTranscriber:
             )
         # Log masked API key for debugging (first 4 and last 4 chars)
         api_key_masked = f"{self.api_key[:4]}...{self.api_key[-4:]}" if len(self.api_key) > 8 else "***"
-        
+
+        # Detect provider type (azure vs openai-compatible)
+        self.provider_type = self._detect_provider()
+        logger.info(f"Remote transcriber provider_type={self.provider_type}, url={self.api_url}")
+
+        # Silence detection threshold (configurable via env, default 0.01)
+        # Prevents sending empty/silent audio patches to remote API (saves API calls and rate limiting)
+        self.silence_threshold = float(os.getenv("REMOTE_TRANSCRIBER_SILENCE_THRESHOLD", "0.01"))
+
         # Model is required by API format but ignored by transcription-service (uses its own MODEL_SIZE)
         # Default to "default" if not provided
         self.model = model or os.getenv("REMOTE_TRANSCRIBER_MODEL") or "default"
@@ -184,6 +192,40 @@ class RemoteTranscriber:
             http2=False,  # Disable HTTP/2 for compatibility
         )
     
+    def _detect_provider(self) -> str:
+        """Detect the remote transcriber provider from env var or URL pattern."""
+        explicit = os.getenv("REMOTE_TRANSCRIBER_TYPE", "").strip().lower()
+        if explicit in ("azure", "openai"):
+            return explicit
+        url_lower = self.api_url.lower()
+        if "cognitiveservices.azure.com" in url_lower or "openai.azure.com" in url_lower:
+            return "azure"
+        return "openai"
+
+    def _is_silence(self, audio: np.ndarray, threshold: float = 0.01) -> bool:
+        """
+        Detect if audio is silence using RMS (Root Mean Square) energy.
+
+        Args:
+            audio: Audio array (float32, normalized to [-1, 1]).
+            threshold: Energy threshold below which audio is considered silence (default 0.01).
+
+        Returns:
+            True if audio is silence, False otherwise.
+        """
+        if len(audio) == 0:
+            return True
+
+        # Calculate RMS energy
+        rms_energy = np.sqrt(np.mean(audio ** 2))
+
+        # If RMS is below threshold, it's silence
+        if rms_energy < threshold:
+            logger.debug(f"Detected silence: RMS energy {rms_energy:.6f} < threshold {threshold}")
+            return True
+
+        return False
+
     def _numpy_to_wav_bytes(self, audio: np.ndarray) -> bytes:
         """
         Convert numpy audio array to WAV file bytes in memory.
@@ -270,40 +312,58 @@ class RemoteTranscriber:
         retry_count = 0
         last_exception = None
         
-        # Prepare headers
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "X-Transcription-Tier": self.transcription_tier,
-        }
-        
-        # Prepare form data
-        data = {
-            "model": self.model,
-            "temperature": self.temperature,
-            "transcription_tier": self.transcription_tier,
-        }
-        
-        if self.vad_model:
-            data["vad_model"] = self.vad_model
-        
-        if language:
-            data["language"] = language
-        
-        if prompt:
-            data["prompt"] = prompt
-        
-        if task == "translate":
-            data["task"] = task
-        
-        # Add response_format if supported (some APIs may ignore this)
-        if self.response_format:
-            data["response_format"] = self.response_format
-        
-        if self.timestamp_granularities:
-            data["timestamp_granularities"] = self.timestamp_granularities
-        
-        # Log request details (masked)
-        auth_header_masked = f"Bearer {self.api_key[:4]}...{self.api_key[-4:]}" if len(self.api_key) > 8 else "Bearer ***"
+        # Prepare headers and form data based on provider type
+        if self.provider_type == "azure":
+            headers = {
+                "api-key": self.api_key,
+            }
+
+            # Azure accepts only: temperature, language, prompt (minimal fields)
+            # No model, transcription_tier, vad_model, task, response_format, or timestamp_granularities
+            data = {
+                "temperature": self.temperature,
+            }
+
+            if language:
+                data["language"] = language
+            if prompt:
+                data["prompt"] = prompt
+
+            # Warn if task doesn't match the Azure URL path
+            if task == "translate" and "/transcriptions" in self.api_url:
+                logger.warning(
+                    "Azure: task is 'translate' but URL contains '/transcriptions'. "
+                    "Use the '/audio/translations' endpoint for translation."
+                )
+            elif task == "transcribe" and "/translations" in self.api_url:
+                logger.warning(
+                    "Azure: task is 'transcribe' but URL contains '/translations'. "
+                    "Use the '/audio/transcriptions' endpoint for transcription."
+                )
+        else:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "X-Transcription-Tier": self.transcription_tier,
+            }
+
+            data = {
+                "model": self.model,
+                "temperature": self.temperature,
+                "transcription_tier": self.transcription_tier,
+            }
+
+            if self.vad_model:
+                data["vad_model"] = self.vad_model
+            if language:
+                data["language"] = language
+            if prompt:
+                data["prompt"] = prompt
+            if task == "translate":
+                data["task"] = task
+            if self.response_format:
+                data["response_format"] = self.response_format
+            if self.timestamp_granularities:
+                data["timestamp_granularities"] = self.timestamp_granularities
         
         while retry_count <= self.max_retries:
             try:
@@ -617,19 +677,31 @@ class RemoteTranscriber:
                 # Token IDs - can't use directly with remote API
                 logger.warning("Token ID prompts not supported by remote API, ignoring")
         
-        # Convert audio to WAV bytes in memory (no temp file I/O)
-        audio_wav_bytes = self._numpy_to_wav_bytes(audio_array)
-        
-        # Normalize language code before API call
-        normalized_language = normalize_language_code(language)
-        
-        # Call remote API with in-memory audio bytes
-        api_response = self._call_remote_api(
-            audio_bytes=audio_wav_bytes,
-            language=normalized_language,
-            prompt=prompt_str,
-            task=task,
-        )
+        # Pre-transcription silence detection: Skip API call if audio is empty/silent
+        # This prevents wasting API calls on empty patches (especially important for rate-limited Azure)
+        if self._is_silence(audio_array, threshold=self.silence_threshold):
+            logger.info(f"Detected silence in audio (RMS < {self.silence_threshold}) - returning empty transcription without API call")
+            # Return empty response in OpenAI format
+            api_response = {
+                "text": "",
+                "language": language or "en",
+                "duration": len(audio_array) / self.sampling_rate,
+                "segments": [],
+            }
+        else:
+            # Convert audio to WAV bytes in memory (no temp file I/O)
+            audio_wav_bytes = self._numpy_to_wav_bytes(audio_array)
+
+            # Normalize language code before API call
+            normalized_language = normalize_language_code(language)
+
+            # Call remote API with in-memory audio bytes
+            api_response = self._call_remote_api(
+                audio_bytes=audio_wav_bytes,
+                language=normalized_language,
+                prompt=prompt_str,
+                task=task,
+            )
         
         # Convert to segments
         segments = self._response_to_segments(api_response)

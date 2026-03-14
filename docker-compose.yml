@@ -134,6 +134,7 @@ services:
       - DEVICE_TYPE=remote
       - REMOTE_TRANSCRIBER_URL=${REMOTE_TRANSCRIBER_URL}
       - REMOTE_TRANSCRIBER_API_KEY=${REMOTE_TRANSCRIBER_API_KEY}
+      - REMOTE_TRANSCRIBER_TYPE=${REMOTE_TRANSCRIBER_TYPE:-}
       - CONSUL_ENABLE=false
       - WL_REDIS_DISCOVERY_ENABLED=false
     command: >-
@@ -274,50 +275,50 @@ services:
       - vexa_default
     restart: unless-stopped
 
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-vexa-access-key}
-      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-vexa-secret-key}
-    volumes:
-      - minio-data:/data
-    ports:
-      - "${MINIO_HOST_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
-    networks:
-      - vexa_default
-    restart: unless-stopped
-
-  minio-init:
-    image: minio/mc:latest
-    depends_on:
-      - minio
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        sleep 5
-        mc alias set vexa http://minio:9000 $${MINIO_ROOT_USER:-vexa-access-key} $${MINIO_ROOT_PASSWORD:-vexa-secret-key}
-        mc mb --ignore-existing vexa/${MINIO_BUCKET:-vexa-recordings}
-        cat > /tmp/cors.xml <<'XML'
-        <CORSConfiguration>
-          <CORSRule>
-            <AllowedOrigin>*</AllowedOrigin>
-            <AllowedMethod>GET</AllowedMethod>
-            <AllowedMethod>HEAD</AllowedMethod>
-            <AllowedHeader>*</AllowedHeader>
-          </CORSRule>
-        </CORSConfiguration>
-        XML
-        mc cors set vexa/${MINIO_BUCKET:-vexa-recordings} /tmp/cors.xml || echo "minio cors set unsupported in this environment; continuing"
-        mc anonymous set download vexa/${MINIO_BUCKET:-vexa-recordings} || true
-        exit 0
-    environment:
-      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-vexa-access-key}
-      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-vexa-secret-key}
-    networks:
-      - vexa_default
+#  minio:
+#    image: minio/minio:latest
+#    command: server /data --console-address ":9001"
+#    environment:
+#      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-vexa-access-key}
+#      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-vexa-secret-key}
+#    volumes:
+#      - minio-data:/data
+#    ports:
+#      - "${MINIO_HOST_PORT:-9000}:9000"
+#      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+#    networks:
+#      - vexa_default
+#    restart: unless-stopped
+#
+#  minio-init:
+#    image: minio/mc:latest
+#    depends_on:
+#      - minio
+#    entrypoint:
+#      - /bin/sh
+#      - -c
+#      - |
+#        sleep 5
+#        mc alias set vexa http://minio:9000 $${MINIO_ROOT_USER:-vexa-access-key} $${MINIO_ROOT_PASSWORD:-vexa-secret-key}
+#        mc mb --ignore-existing vexa/${MINIO_BUCKET:-vexa-recordings}
+#        cat > /tmp/cors.xml <<'XML'
+#        <CORSConfiguration>
+#          <CORSRule>
+#            <AllowedOrigin>*</AllowedOrigin>
+#            <AllowedMethod>GET</AllowedMethod>
+#            <AllowedMethod>HEAD</AllowedMethod>
+#            <AllowedHeader>*</AllowedHeader>
+#          </CORSRule>
+#        </CORSConfiguration>
+#        XML
+#        mc cors set vexa/${MINIO_BUCKET:-vexa-recordings} /tmp/cors.xml || echo "minio cors set unsupported in this environment; continuing"
+#        mc anonymous set download vexa/${MINIO_BUCKET:-vexa-recordings} || true
+#        exit 0
+#    environment:
+#      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-vexa-access-key}
+#      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-vexa-secret-key}
+#    networks:
+#      - vexa_default
 
 volumes:
   redis-data:
